@@ -1,0 +1,179 @@
+services:
+- type: web
+  name: hajj-umrah-system
+  env: python
+  buildCommand: pip install -r requirements.txt
+  # --timeout 300: analyzing a YouTube video's ~150 comments runs that many
+  # AI calls in one request (POST /api/youtube/analyze). Gunicorn's default
+  # 30s worker timeout would kill that mid-way; 300s (5 min) gives it room.
+  # --workers 2 keeps the site responsive while a long analysis runs.
+  startCommand: gunicorn app:app --timeout 300 --workers 2
+  # ---------------------------------------------------------------
+  # PERMANENT STORAGE — external PostgreSQL (NO Persistent Disk needed)
+  #
+  # All data (user accounts, the admin account, comments, login logs)
+  # is stored in an EXTERNAL PostgreSQL database referenced by the
+  # DATABASE_URL environment variable. Because the database lives
+  # outside this service's filesystem, NOTHING is lost when the app
+  # is closed, restarted, or redeployed on Render's FREE plan.
+  #
+  # Setup (one time):
+  #   1) Create a free PostgreSQL database. RECOMMENDED: Neon
+  #      (https://neon.tech) — free and does NOT expire.
+  #      (Render's own free PostgreSQL is DELETED after 30 days,
+  #       so do not use it for permanent data.)
+  #   2) Copy its connection string, e.g.
+  #      postgresql://user:pass@host/dbname?sslmode=require
+  #   3) In the Render dashboard -> your service -> Environment ->
+  #      add DATABASE_URL with that value (sync: false below means
+  #      the value is set in the dashboard, not in this file).
+  #
+  # Without DATABASE_URL the app falls back to a local SQLite file —
+  # for local development only (wiped on redeploy on the free plan).
+  # ---------------------------------------------------------------
+  envVars:
+  - key: DATABASE_URL
+    sync: false
+  #
+  # ---- v15.6: Gemini resilience (429 / quota handling) ----
+  # The AI assistant + comment analyzer share one hardened Gemini client
+  # (llm_client.py): on HTTP 429 RESOURCE_EXHAUSTED it honors the server's
+  # retryDelay, does a short bounded retry, rolls over to a lighter model
+  # with a separate quota bucket (gemini-2.5-flash-lite), then trips a short
+  # cooldown so the site instantly falls back instead of hammering the API —
+  # the UI never hangs and a clear "busy, try again" message is shown. All
+  # optional, sensible defaults:
+  #   GEMINI_MODEL             assistant model (default gemini-2.5-flash)
+  #   GEMINI_TIMEOUT           per-request seconds (default 30)
+  #   GEMINI_RL_RETRIES        extra tries on 429/503 (default 1)
+  #   GEMINI_RL_MAX_WAIT       max seconds to wait on a 429 (default 4)
+  #   GEMINI_COOLDOWN_SECONDS  pause after quota exhaustion (default 60)
+  #
+  # ---- v15.5: email OTP sign-in (REAL email verification) ----
+  # A 6-digit code is emailed to the address the user types, and the account
+  # is created / signed in ONLY after that exact code is entered — so nobody
+  # can register or sign in with an email they don't control. Set these in
+  # the Render dashboard to enable it (the login page shows a "sign in with
+  # email code" button once SMTP is configured; without it, that button is
+  # hidden and email/password + Google sign-in work exactly as before):
+  #   SMTP_HOST         e.g. smtp.gmail.com
+  #   SMTP_PORT         587 (STARTTLS) or 465 (SSL). Default 587.
+  #   SMTP_USER         the sending mailbox / username
+  #   SMTP_PASSWORD     an App Password (Gmail: Google Account -> Security ->
+  #                     App passwords) — NOT the normal account password
+  #   SMTP_FROM         (optional) visible From address; defaults to SMTP_USER
+  #   OTP_TTL_SECONDS   (optional) code lifetime, default 600 (10 min)
+  #   OTP_RESEND_SECONDS(optional) min gap between sends, default 45
+  #   OTP_MAX_ATTEMPTS  (optional) wrong tries before a new code is needed, default 5
+  #
+  # ---- v15.5: YouTube video comment analysis ----
+  # The admin "YouTube Analysis" page pulls ~150 REAL comments from a single
+  # video (by URL) via POST /api/youtube/analyze and runs them through the
+  # same AI pipeline as everything else — reusing the existing YOUTUBE_API_KEY
+  # below. No comments are ever generated; only real user comments are fetched
+  # and analyzed. (startCommand above raises Gunicorn's worker timeout to 300s
+  # so analyzing 150 comments in one request isn't cut off.)
+  #
+  # ---- v12: OPTIONAL external comments (official APIs only) ----
+  # Add any of these in the Render dashboard to enable fetching public
+  # comments about Hajj & Umrah (auto-refreshed hourly, de-duplicated,
+  # source shown on every comment). All are optional — without them the
+  # site works normally with user reviews only.
+  #   YOUTUBE_API_KEY        (YouTube Data API v3 key)
+  #   REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET / REDDIT_USER_AGENT
+  #   X_BEARER_TOKEN         (X API v2 — requires recent-search access)
+  #   FETCH_INTERVAL_MINUTES (default 60)
+  #   AUTO_FETCH_EXTERNAL    ("0" disables the hourly refresh)
+  #
+  # ---- v13: OPTIONAL strongest sentiment model ----
+  #   HF_API_TOKEN  (free token from huggingface.co -> Settings -> Access
+  #                  Tokens) enables the multilingual transformer
+  #                  cardiffnlp/twitter-xlm-roberta-base-sentiment via the
+  #                  HF Inference API. Without it, the app analyzes the
+  #                  English translation with VADER — still accurate,
+  #                  fully self-contained.
+  #
+  # ---- v14: OPTIONAL top-accuracy AI pipeline (your own keys, no lock-in) ----
+  #   ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY : ONE cheap LLM
+  #       call per comment handles language + sentiment (context/sarcasm/
+  #       mixed opinions) + content moderation + Hajj/Umrah relevance.
+  #       Highest accuracy. If more than one key is set, each request tries
+  #       them in order — Gemini -> ChatGPT -> Claude — automatically
+  #       falling over to the next one if a provider is rate-limited or
+  #       fails, with no visible difference to the user.
+  #   LLM_MODEL          : override the default model name (optional) —
+  #       defaults are claude-haiku-4-5-20251001 / gpt-4o-mini /
+  #       gemini-flash-latest depending on which key above is set.
+  #   EXTRA_BANNED_WORDS : comma-separated extra words for the local filter
+  # Without an LLM key the tiered fallback runs: HF transformer / VADER for
+  # sentiment, HF toxicity model + local wordlists for moderation, topic
+  # heuristics for relevance of EXTERNAL comments.
+  #
+  # ---- v15: "تعليمات الحج والعمرة" AI assistant ----
+  # No extra keys needed — the assistant (assistant.py) reuses
+  # ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_MODEL above.
+  # Without a key it still answers on-topic questions from a curated
+  # knowledge base (knowledge_base.py), just less conversationally, and
+  # still refuses off-topic questions.
+  #
+  # ---- v15.2: getting a GEMINI_API_KEY ----
+  # Google AI Studio -> https://aistudio.google.com/apikey -> Create API
+  # key. Paste the value into GEMINI_API_KEY in the Render dashboard (or
+  # GOOGLE_API_KEY — both are read). No SDK/package needed; the app talks
+  # to the Gemini REST API directly with the existing `requests` dependency,
+  # same as the Anthropic/OpenAI tiers above.
+  #
+  # ---- v15: OPTIONAL Google Maps Reviews (auto-fetch) ----
+  #   GOOGLE_MAPS_API_KEY    A Google Places API key with Place Details enabled
+  #   GOOGLE_MAPS_PLACE_IDS  Comma-separated Google Place IDs to pull reviews
+  #                          from (hotels, transport companies, Hajj/Umrah
+  #                          campaigns, etc.) — find a place's ID at
+  #                          https://developers.google.com/maps/documentation/places/web-service/place-id
+  # The Places API only returns a handful of "most relevant" reviews per
+  # place (an official API limitation, not a bug here). Without these two
+  # variables set, Google Maps stays available via the manual/admin import
+  # endpoint (POST /api/admin/import-reviews) — no key required for that.
+  #
+  # ---- v15.7: OPTIONAL Apify (YouTube / Google Maps / Reddit actors) ----
+  #   APIFY_API_TOKEN          your Apify account API token. Can also be set
+  #                            (or rotated) from the admin Settings page in
+  #                            the site itself, which takes priority over
+  #                            this env var.
+  #   APIFY_ENABLED            "0" disables Apify even with a token set
+  #                            (default "1"); the admin Settings page toggle
+  #                            overrides this once it has been used.
+  #   APIFY_YOUTUBE_ACTOR / APIFY_GOOGLE_MAPS_ACTOR / APIFY_REDDIT_ACTOR
+  #                            override the default actor id used for each
+  #                            platform — verify these against your own
+  #                            Apify Store subscription (see apify_source.py).
+  #   APIFY_SEARCH_QUERY       override the default "Hajj Umrah experience"
+  #                            search query
+  #   APIFY_MAX_ITEMS_PER_ACTOR  cap per actor run (default 50)
+  # Comments fetched via Apify are merged into the same comments table and
+  # the same moderation/relevance/dedup pipeline as every other source —
+  # nothing separate. A failed/expired token or an Apify outage only skips
+  # Apify for that run; every other source keeps working normally.
+  #
+  # ---- v15.4: Google sign-in — REAL, once GOOGLE_OAUTH_CLIENT_ID is set ----
+  #   GOOGLE_OAUTH_CLIENT_ID   an OAuth 2.0 Client ID, "Web application" type
+  # Get one at https://console.cloud.google.com/apis/credentials -> Create
+  # Credentials -> OAuth client ID -> Web application. Under "Authorized
+  # JavaScript origins" add this site's exact URL(s), e.g.
+  # https://your-app.onrender.com (and http://localhost:5000 for local
+  # testing) — Google rejects the sign-in otherwise. No client SECRET is
+  # needed here: the login page uses Google's JS "Sign In With Google"
+  # button, which hands back a signed ID token directly in the browser; the
+  # backend verifies that token against Google (audience, issuer, verified
+  # email) before trusting it, then finds-or-creates the account by email —
+  # same accounts table, same login session as email/password sign-in.
+  # Without this variable set, the login page's Google button still shows
+  # as "coming soon", exactly as before — nothing else changes.
+  #
+  # ---- v15: OPTIONAL Apple sign-in (prepared, not yet wired up) ----
+  #   APPLE_OAUTH_CLIENT_ID
+  # Setting this only changes the "not configured" message the API
+  # returns — real "Sign in with Apple" verification (checking the
+  # client's id_token against Apple's public keys and finding-or-creating
+  # the user by verified email) still needs to be implemented in
+  # app.py's apple_login(), following the same shape as google_login()
+  # above. The login page's Apple button is visible today as "coming soon".
